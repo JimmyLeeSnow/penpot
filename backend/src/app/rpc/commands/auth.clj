@@ -22,15 +22,19 @@
    [app.loggers.audit :as audit]
    [app.rpc :as-alias rpc]
    [app.rpc.climit :as-alias climit]
+   [app.rpc.commands.management :as management]
    [app.rpc.commands.profile :as profile]
    [app.rpc.commands.teams :as teams]
    [app.rpc.doc :as-alias doc]
    [app.rpc.helpers :as rph]
    [app.setup :as-alias setup]
+   [app.setup.templates :as tmpl]
    [app.tokens :as tokens]
    [app.util.services :as sv]
    [app.util.time :as dt]
-   [cuerdas.core :as str]))
+   [app.worker :as-alias wrk]
+   [cuerdas.core :as str]
+   [promesa.exec :as px]))
 
 (def schema:password
   [::sm/word-string {:max 500}])
@@ -325,6 +329,21 @@
                     {::db/return-keys true})
         (profile/decode-row))))
 
+(defn create-initial-file
+  [cfg profile]
+  (let [cfg             (dissoc cfg ::db/conn)
+        params          {:profile-id (:id profile)
+                         :project-id (:default-project-id profile)}
+
+        template-stream (tmpl/get-template-stream cfg "plants-app")
+        file-id         (-> (management/clone-template cfg params template-stream)
+                            first)]
+
+    (db/tx-run! cfg (fn [{:keys [::db/conn] :as cfg}]
+                      (profile/update-profile-props conn (:id profile) {:default-file-id file-id})))))
+
+
+
 (defn send-email-verification!
   [{:keys [::db/conn] :as cfg} profile]
   (let [vtoken (tokens/generate (::setup/props cfg)
@@ -347,7 +366,7 @@
                 :extra-data ptoken})))
 
 (defn register-profile
-  [{:keys [::db/conn] :as cfg} {:keys [token fullname] :as params}]
+  [{:keys [::db/conn ::wrk/executor] :as cfg} {:keys [token fullname initial-file] :as params}]
   (let [claims     (tokens/verify (::setup/props cfg) {:token token :iss :prepared-register})
         params     (-> claims
                        (into params)
@@ -375,7 +394,11 @@
         invitation (when-let [token (:invitation-token params)]
                      (tokens/verify (::setup/props cfg) {:token token :iss :team-invitation}))
 
-        props      (audit/profile->props profile)]
+        props      (audit/profile->props profile)
+
+        create-initial-file-when-needed
+        #(when initial-file
+           (px/run! executor (partial create-initial-file cfg profile)))]
 
     (cond
       ;; When profile is blocked, we just ignore it and return plain data
@@ -416,7 +439,8 @@
             (rph/with-meta
               {::audit/replace-props props
                ::audit/context {:action "login"}
-               ::audit/profile-id (:id profile)}))
+               ::audit/profile-id (:id profile)
+               ::before-complete-fns [create-initial-file-when-needed]}))
 
         (do
           (when-not (eml/has-reports? conn (:email profile))
@@ -425,7 +449,8 @@
           (rph/with-meta {:email (:email profile)}
             {::audit/replace-props props
              ::audit/context {:action "email-verification"}
-             ::audit/profile-id (:id profile)})))
+             ::audit/profile-id (:id profile)
+             ::rpc/before-complete-fns [create-initial-file-when-needed]})))
 
       :else
       (let [elapsed? (elapsed-verify-threshold? profile)
@@ -456,7 +481,8 @@
 (def schema:register-profile
   [:map {:title "register-profile"}
    [:token schema:token]
-   [:fullname [::sm/word-string {:max 100}]]])
+   [:fullname [::sm/word-string {:max 100}]]
+   [:initial-file {:optional true} [:boolean]]])
 
 (sv/defmethod ::register-profile
   {::rpc/auth false

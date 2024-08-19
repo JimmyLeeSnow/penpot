@@ -25,6 +25,8 @@
    [beicon.v2.core :as rx]
    [potok.v2.core :as ptk]))
 
+(declare update-profile-props)
+
 ;; --- SCHEMAS
 
 (def ^:private
@@ -152,14 +154,19 @@
   profile. The profile can proceed from standard login or from
   accepting invitation, or third party auth signup or singin."
   [profile]
-  (letfn [(get-redirect-event []
+  (letfn [(get-redirect-events []
             (let [team-id (get-current-team-id profile)
-                  redirect-url (:redirect-url @storage)]
+                  redirect-url (:redirect-url @storage)
+                  default-file-id (get-in profile [:props :default-file-id])]
               (if (some? redirect-url)
                 (do
                   (swap! storage dissoc :redirect-url)
                   (.replace js/location redirect-url))
-                (rt/nav' :dashboard-projects {:team-id team-id}))))]
+                (if (some? default-file-id)
+                  [(rt/nav' :workspace {:project-id (:default-project-id profile)
+                                        :file-id default-file-id})
+                   (update-profile-props {:default-file-id nil})]
+                  [(rt/nav' :dashboard-projects {:team-id team-id})]))))]
 
     (ptk/reify ::logged-in
       ev/Event
@@ -176,10 +183,11 @@
       ptk/WatchEvent
       (watch [_ _ _]
         (when (is-authenticated? profile)
-          (->> (rx/of (profile-fetched profile)
-                      (fetch-teams)
-                      (get-redirect-event)
-                      (ws/initialize))
+          (->> (rx/concat
+                (rx/of (profile-fetched profile)
+                       (fetch-teams)
+                       (ws/initialize))
+                (rx/from (get-redirect-events)))
                (rx/observe-on :async)))))))
 
 (declare login-from-register)
